@@ -156,19 +156,31 @@ tests/          pytest suite (runs on CPU in CI)
 
 ## Sources:
 Attention is All you Need - (2017) 
+
 An Extremely Opinionated Annotated List of My Favourite Mechanistic Interpretability Papers v2
+
 A Mathematical Framework for Transformer Circuits
+
 Efficient Estimation of Word Representations in Vector Space
+
 https://github.com/karpathy/ng-video-lecture/tree/master
+
 https://github.com/google/sentencepiece
+
 https://github.com/openai/tiktoken
+
 https://notes.theomorales.com/Attention+is+all+you+need/The+Scaled+Dot-Product+Attention+function#:~:text=The%20output%20is%20computed%20as,queries%2C%20keys%20and%20values%20exactly
+
 https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+
 https://arxiv.org/pdf/2005.14165
 
 **Courses Used for Preliminary Research:**
+
 Linear Algebra Done Right by Sheldon Axler: https://linear.axler.net/LADR4e.pdf
+
 Andrej Karpathy: (Neural Networks: Zero to Hero)
+
 3Blue1Brown: (Neural Networks, Essence of Linear Algebra, Large Language Models.)
 
 
