@@ -152,7 +152,6 @@ tests/          pytest suite (runs on CPU in CI)
 - **Unused layers removed.** In the original code, the last block also computed steps 4–6 for `x`. The prediction is read from `p`, and nothing flows from `x` back to `p` after step 4, so those layers (about 2.7 M parameters) never received a gradient. They're no longer built. The function the model computes is unchanged; the reported parameter count is the honest one, 64.1 M rather than 66.75 M.
 - **The pad starts empty.** Because `p = 0` entering block 0, its first read of `x` uses the same query at every position until training moves LayerNorm's bias, and that LayerNorm's scale never receives a gradient. This is harmless, but it is an interesting thing to vary, for example with a learned initial pad.
 - **Several epochs.** 10,000 steps × 64 × 512 tokens is more than one pass over WikiText-103's training set; `train.py` prints the exact epoch count. Compare models on validation loss, not training loss.
-- **Code Written/Tested Originally In Google Collab** All the code originally was written in Google Colab and moved over with the help of Claude.
 
 ## Sources:
 Attention is All you Need - (2017) 
