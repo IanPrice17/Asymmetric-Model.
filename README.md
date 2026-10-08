@@ -1,6 +1,6 @@
 # Think-Pad
 
-**A dual-stream transformer language model, compared with a standard GPT at matched parameters and matched training compute.**
+**A dual-stream transformer language model, compared with a standard GPT (Modeled after GPT-3) at matched parameters and matched training compute.**
 
 Think-Pad adds a second residual stream, the *pad* (`p`), next to the usual token stream (`x`). The pad starts at zero, repeatedly reads from `x` through cross-attention, exchanges information with `x` through learned gates, and is the stream the next-token prediction is made from. The question this repo tests is whether giving a model a separate stream to "work things out" in improves language modeling at the same cost.
 
