@@ -1,0 +1,28 @@
+[project]
+name = "thinkpad"
+version = "0.1.0"
+description = "Think-Pad: a dual-stream transformer language model, benchmarked against a GPT baseline at matched compute"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.3", "numpy", "tiktoken", "datasets", "matplotlib"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["thinkpad"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "tests"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["tests/legacy_*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E731"]
