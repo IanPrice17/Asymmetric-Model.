@@ -12,6 +12,8 @@ Phases (run in this order; pick with --phases):
   layers    run the cross-stream steps (2-5) only in some layers; self-attention
             and both FFNs still run in every layer
   combine   the cuts that helped, together
+  p_attention  lean_first_half plus self-attention on p (after p reads x, before
+            the gates), in different layers
   baseline  plain GPT at the same compute, for reference
 
 Usage:
@@ -43,6 +45,13 @@ from .flops import analytic_train_flops
 from .model import build_model, count_params
 
 CROSS_STEPS = ("p_read1", "p_read2", "gate_x", "gate_p", "bypass")
+LEAN_FIRST_HALF = {
+    "p_read2": "none",
+    "bypass": "none",
+    "gate_p": "none",
+    "p_read1": "first:half",
+    "gate_x": "first:half",
+}
 
 
 @dataclass(frozen=True)
@@ -95,17 +104,28 @@ VARIANTS = [
         "lean_first_half",
         "combine",
         "lean, with the remaining cross steps (2, 4x) only in the first half",
-        {
-            "p_read2": "none",
-            "bypass": "none",
-            "gate_p": "none",
-            "p_read1": "first:half",
-            "gate_x": "first:half",
-        },
+        LEAN_FIRST_HALF,
     ),
+    *[
+        Variant(
+            f"lean_fh_psa_{tag}",
+            "p_attention",
+            f"lean_first_half + p self-attention {where}",
+            {**LEAN_FIRST_HALF, "sa_p": spec},
+        )  # fmt: skip
+        for tag, spec, where in (
+            ("all", "all", "in every layer"),
+            ("first_half", "first:half", "in the first half (with the x reads)"),
+            ("last_half", "last:half", "in the second half (the p-only layers)"),
+            ("even", "even", "in even layers"),
+            ("odd", "odd", "in odd layers"),
+            ("first1", "first:1", "in the first layer only"),
+            ("last1", "last:1", "in the last layer only"),
+        )
+    ],
     Variant("gpt_baseline", "baseline", "plain GPT, same compute", baseline=True),
 ]
-PHASES = ("cut", "isolate", "layers", "combine", "baseline")
+PHASES = ("cut", "isolate", "layers", "combine", "p_attention", "baseline")
 
 
 def run_dir(out_root: str, v: Variant, seed: int, n_seeds: int) -> str:

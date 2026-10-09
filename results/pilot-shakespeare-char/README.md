@@ -54,6 +54,29 @@ The order is unchanged with twice the training, and the gaps shrink slightly.
 
 ![Validation loss vs compute, 2x budget](val_loss_vs_flops_1600.png)
 
+## Adding self-attention to p (on lean_first_half)
+
+**Result:** no placement beat lean_first_half without it. Self-attention in layer 0 cost about 0.07–0.09; anywhere else it roughly broke even.
+
+p self-attention (`--sa_p`) runs after p reads x and before the step-4 gate, so in layers with a gate its output reaches x the same block. Same 800-step compute budget, 2 seeds.
+
+| Rank | p self-attention in layers | Params (M) | Steps | Val loss | Δ vs none |
+|---|---|---|---|---|---|
+| 1 | none (lean_first_half) | 0.97 | 2,015 | 1.798 ± 0.006 | 0 |
+| 2 | 3 (last only) | 1.04 | 1,866 | 1.801 ± 0.018 | +0.003 |
+| 3 | 1, 3 (odd) | 1.10 | 1,737 | 1.804 ± 0.006 | +0.006 |
+| 4 | 2, 3 (second half, the p-only layers) | 1.10 | 1,737 | 1.805 ± 0.008 | +0.007 |
+| 5 | 0, 2 (even) | 1.10 | 1,737 | 1.866 ± 0.027 | +0.068 |
+| 6 | 0, 1 (first half) | 1.10 | 1,737 | 1.871 ± 0.007 | +0.073 |
+| 7 | 0 (first only) | 1.04 | 1,866 | 1.891 ± 0.057 | +0.093 |
+| 8 | 0–3 (all) | 1.23 | 1,527 | 1.893 ± 0.007 | +0.095 |
+
+- **Layer 0 is the problem.** Every placement that includes layer 0 is about 0.07–0.09 worse, and none of the others is. At layer 0, p has read x only once, starting from zero, so attending over its own earlier positions adds little, and its output then enters x through the gate.
+- **Elsewhere it doesn't pay for itself.** Later placements land within noise of no self-attention, so the extra compute buys nothing at this scale.
+- The size-matched 5-layer GPT (1.759) is still ahead of every variant here.
+
+![Validation loss vs compute, p self-attention placements](val_loss_vs_flops_p_attention.png)
+
 ## What it means
 
 - **Cost dominates at this scale.** The ranking mostly follows how many steps each variant could afford. Every run was still improving at the end, so cheaper models win.

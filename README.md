@@ -134,6 +134,7 @@ Every step of the Think-Pad block except x's self-attention can be switched off,
 | `--bypass` | 5 · x attends to p, result feeds x's FFN |
 | `--ffn_x` | 6 · x FFN |
 | `--ffn_p` | 7 · p FFN |
+| `--sa_p` | p self-attention, after p reads x and before the gates (not in the original design; off by default) |
 
 Each takes a layer spec: `all` (default), `none`, `even`, `odd`, `first:K`, `last:K` (K may be `half`), or indices like `0,3,5`. For example, `--p_read2 none --bypass even` reads x once per layer and keeps the bypass only in even layers. Layers that are switched off aren't built, so parameters and FLOPs drop with them.
 

@@ -22,6 +22,7 @@ STEP_FIELDS = {
     "bypass": "step 5: x attends to p, result feeds x's FFN",
     "ffn_x": "step 6: x FFN",
     "ffn_p": "step 7: p FFN",
+    "sa_p": "p self-attention, after p reads x and before the step-4 gates (off by default)",
 }
 
 
@@ -72,6 +73,7 @@ class ModelConfig:
     bypass: str = "all"
     ffn_x: str = "all"
     ffn_p: str = "all"
+    sa_p: str = "none"  # not in the original design
 
     def __post_init__(self) -> None:
         if self.arch not in ("thinkpad", "baseline"):
@@ -86,8 +88,9 @@ class ModelConfig:
         return layer_set(getattr(self, step), self.n_layer)
 
     def ablated_steps(self) -> dict[str, str]:
-        """Step switches that differ from the full model."""
-        return {k: getattr(self, k) for k in STEP_FIELDS if getattr(self, k) != "all"}
+        """Step switches that differ from the full (original) model."""
+        defaults = {f.name: f.default for f in fields(self)}
+        return {k: getattr(self, k) for k in STEP_FIELDS if getattr(self, k) != defaults[k]}
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

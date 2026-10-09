@@ -112,3 +112,25 @@ def test_ablation_runner_end_to_end(tmp_path):
     rows = {r["variant"]: r for r in json.loads((out / "summary.json").read_text())}
     assert rows["full"]["steps"] == 40
     assert rows["one_read_no_bypass"]["steps"] > 40
+
+
+def test_p_self_attention_runs_before_the_gate():
+    """sa_p sits between p's reads and the step-4 gate, so in the same block it already
+    changes what the gate passes into x."""
+    torch.manual_seed(0)
+    cfg = replace(BASE, sa_p="0")
+    model = build_model(cfg).eval()
+    block = model.blocks[0]
+    assert block.use_sa_p and block.use_gate_x
+    x = torch.randn(2, 8, cfg.n_embd)
+    with torch.no_grad():
+        x_out, _ = block(x, torch.zeros_like(x))
+        block.sa_p.proj.weight.mul_(5.0)
+        x_out2, _ = block(x, torch.zeros_like(x))
+    assert not torch.allclose(x_out, x_out2)
+
+
+def test_p_self_attention_off_by_default():
+    assert BASE.sa_p == "none"
+    assert not any(b.use_sa_p for b in build_model(BASE).blocks)
+    assert replace(BASE, sa_p="all").ablated_steps() == {"sa_p": "all"}

@@ -200,6 +200,7 @@ class ThinkPadBlock(nn.Module):
         self.use_read2 = on["p_read2"]
         self.use_gate_p = on["gate_p"]
         self.use_ffn_p = on["ffn_p"]
+        self.use_sa_p = on["sa_p"]
         self.use_gate_x = on["gate_x"] and x_live
         self.use_ffn_x = on["ffn_x"] and x_live
         self.use_bypass = on["bypass"] and self.use_ffn_x  # bypass only feeds x's FFN
@@ -215,6 +216,9 @@ class ThinkPadBlock(nn.Module):
             self.mha_p2 = MultiHeadAttention(cfg)
             self.ln_p2_p = nn.LayerNorm(n)
             self.ln_p2_x = nn.LayerNorm(n)
+        if self.use_sa_p:  # Optional: p self-attention, after p's reads, before the gates
+            self.sa_p = MultiHeadAttention(cfg)
+            self.ln_p_sa = nn.LayerNorm(n)
         if self.use_gate_x:  # Step 4, x side: gate p into x, then post-LN
             self.gate_x = GatedCrossConnect(cfg)
             self.ln_x_post = nn.LayerNorm(n)
@@ -239,6 +243,9 @@ class ThinkPadBlock(nn.Module):
             p = p + self.mha_p1(self.ln_p1_p(p), kv_src=self.ln_p1_x(x))
         if self.use_read2:
             p = p + self.mha_p2(self.ln_p2_p(p), kv_src=self.ln_p2_x(x))
+
+        if self.use_sa_p:  # p attends to its own earlier positions before the exchange
+            p = p + self.sa_p(self.ln_p_sa(p))
 
         # Step 4: both gates read the streams as they were *before* the exchange.
         x_pre, p_pre = x, p
