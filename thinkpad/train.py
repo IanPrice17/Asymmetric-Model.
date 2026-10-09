@@ -34,7 +34,7 @@ from dataclasses import fields
 import torch
 
 from .config import MODEL_PRESETS, ModelConfig, TrainConfig
-from .data import TokenData, prepare_wikitext103, split_path
+from .data import TokenData, load_codec, prepare, split_path
 from .flops import analytic_train_flops
 from .model import build_model, count_params, load_state_dict_compat
 
@@ -51,7 +51,17 @@ def resolve_device(name: str) -> str:
     return "cpu"
 
 
+def resolve_dtype(device: str, dtype: str) -> str:
+    """bfloat16 where the hardware runs it natively, float32 elsewhere (CPU, MPS, T4/V100)."""
+    if dtype != "auto":
+        return dtype
+    if torch.device(device).type == "cuda" and torch.cuda.is_bf16_supported():
+        return "bfloat16"
+    return "float32"
+
+
 def autocast_ctx(device: str, dtype: str):
+    dtype = resolve_dtype(device, dtype)
     if dtype == "float32":
         return contextlib.nullcontext()
     if dtype != "bfloat16":
@@ -261,7 +271,13 @@ def finalize(mc: ModelConfig, tc: TrainConfig, device: str, ctx) -> dict:
     )
     load_state_dict_compat(model, best["model_state"])
 
-    results = {"arch": mc.arch, "best_iter": best["iter"], "params": count_params(model)}
+    results = {
+        "arch": mc.arch,
+        "ablated_steps": mc.ablated_steps() if mc.arch == "thinkpad" else {},
+        "best_iter": best["iter"],
+        "params": count_params(model),
+        "non_embedding_params": count_params(model, non_embedding=True),
+    }
     for split in ("validation", "test"):
         data = TokenData(split_path(tc.data_dir, split), mc.block_size, tc.batch_size, device)
         loss = eval_full(model, data, ctx)
@@ -273,13 +289,11 @@ def finalize(mc: ModelConfig, tc: TrainConfig, device: str, ctx) -> dict:
     if tc.sample_tokens <= 0:
         return results
 
-    import tiktoken
-
-    enc = tiktoken.get_encoding("gpt2")
+    encode, decode = load_codec(tc.data_dir)
     torch.manual_seed(tc.seed)
-    prompt = torch.tensor([enc.encode_ordinary("The history of")], device=device)
+    prompt = torch.tensor([encode("The history of")], device=device)
     out = model.generate(prompt, tc.sample_tokens, temperature=0.8, top_k=40)
-    text = enc.decode(out[0].tolist())
+    text = decode(out[0].tolist())
     with open(os.path.join(tc.out_dir, "sample.txt"), "w") as f:
         f.write(text + "\n")
     print(text)
@@ -338,7 +352,7 @@ def parse_args(argv=None) -> tuple[ModelConfig, TrainConfig, bool]:
 def main(argv=None) -> None:
     mc, tc, skip_prepare = parse_args(argv)
     if not skip_prepare:
-        prepare_wikitext103(tc.data_dir)
+        prepare(tc.dataset, tc.data_dir)
     train(mc, tc)
 
 

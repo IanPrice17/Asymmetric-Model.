@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from .config import ModelConfig
+from .config import STEP_FIELDS, ModelConfig
 
 # ── Shared layers ─────────────────────────────────────────────────────────
 
@@ -181,66 +181,89 @@ class _LanguageModel(nn.Module):
 class ThinkPadBlock(nn.Module):
     """One dual-stream block.
 
-    In the final block, steps 4–6 for ``x`` are skipped: the loss is computed
-    from ``p`` only, and after step 4 nothing flows from ``x`` back into ``p``,
-    so those layers would never receive a gradient. Leaving them out does not
-    change the function the model computes.
+    Which steps run is set per layer by the config's step switches (all on by
+    default). Parts of the ``x`` stream that can no longer reach ``p`` are not
+    built: the loss is computed from ``p`` only, so after the last point where
+    ``p`` reads ``x`` (``last_x_read``), further ``x`` updates would never get a
+    gradient. With the default config this removes steps 4-6 for ``x`` in the
+    final block, which does not change the function the model computes.
     """
 
-    def __init__(self, cfg: ModelConfig, is_last: bool = False):
+    def __init__(self, cfg: ModelConfig, layer: int, last_x_read: int):
         super().__init__()
         n = cfg.n_embd
-        self.is_last = is_last
+        on = {step: layer in cfg.layers(step) for step in STEP_FIELDS}
+        x_live = layer < last_x_read  # does x after this layer's reads still matter?
 
-        # Step 1: x self-attention
-        self.sa_x = MultiHeadAttention(cfg)
-        self.ln_x1 = nn.LayerNorm(n)
-        # Step 2: p reads x
-        self.mha_p1 = MultiHeadAttention(cfg)
-        self.ln_p1_p = nn.LayerNorm(n)
-        self.ln_p1_x = nn.LayerNorm(n)
-        # Step 3: p reads x again (separate weights)
-        self.mha_p2 = MultiHeadAttention(cfg)
-        self.ln_p2_p = nn.LayerNorm(n)
-        self.ln_p2_x = nn.LayerNorm(n)
-        # Step 4: gated exchange between streams, then post-LN
-        self.gate_p = GatedCrossConnect(cfg)
-        self.ln_p_post = nn.LayerNorm(n)
-        # Step 7: p FFN
-        self.ffwd_p = FeedForward(cfg)
-        self.ln_p_ffn = nn.LayerNorm(n)
+        self.use_sa_x = layer <= last_x_read
+        self.use_read1 = on["p_read1"]
+        self.use_read2 = on["p_read2"]
+        self.use_gate_p = on["gate_p"]
+        self.use_ffn_p = on["ffn_p"]
+        self.use_gate_x = on["gate_x"] and x_live
+        self.use_ffn_x = on["ffn_x"] and x_live
+        self.use_bypass = on["bypass"] and self.use_ffn_x  # bypass only feeds x's FFN
 
-        if not is_last:
-            # Step 4 (x side)
+        if self.use_sa_x:  # Step 1: x self-attention
+            self.sa_x = MultiHeadAttention(cfg)
+            self.ln_x1 = nn.LayerNorm(n)
+        if self.use_read1:  # Step 2: p reads x
+            self.mha_p1 = MultiHeadAttention(cfg)
+            self.ln_p1_p = nn.LayerNorm(n)
+            self.ln_p1_x = nn.LayerNorm(n)
+        if self.use_read2:  # Step 3: p reads x again (separate weights)
+            self.mha_p2 = MultiHeadAttention(cfg)
+            self.ln_p2_p = nn.LayerNorm(n)
+            self.ln_p2_x = nn.LayerNorm(n)
+        if self.use_gate_x:  # Step 4, x side: gate p into x, then post-LN
             self.gate_x = GatedCrossConnect(cfg)
             self.ln_x_post = nn.LayerNorm(n)
-            # Step 5: x reads p; result feeds x's FFN only
+        if self.use_gate_p:  # Step 4, p side: gate x into p, then post-LN
+            self.gate_p = GatedCrossConnect(cfg)
+            self.ln_p_post = nn.LayerNorm(n)
+        if self.use_bypass:  # Step 5: x reads p; result feeds x's FFN only
             self.mha_bypass = MultiHeadAttention(cfg)
             self.ln_by_x = nn.LayerNorm(n)
             self.ln_by_p = nn.LayerNorm(n)
-            # Step 6: x FFN on [LN(x), bypass]
-            self.ffwd_x = FeedForward(cfg, input_dim=2 * n)
+        if self.use_ffn_x:  # Step 6: x FFN on [LN(x), bypass] (or LN(x) without bypass)
+            self.ffwd_x = FeedForward(cfg, input_dim=2 * n if self.use_bypass else n)
             self.ln_x_ffn = nn.LayerNorm(n)
+        if self.use_ffn_p:  # Step 7: p FFN
+            self.ffwd_p = FeedForward(cfg)
+            self.ln_p_ffn = nn.LayerNorm(n)
 
     def forward(self, x: torch.Tensor, p: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = x + self.sa_x(self.ln_x1(x))
-        p = p + self.mha_p1(self.ln_p1_p(p), kv_src=self.ln_p1_x(x))
-        p = p + self.mha_p2(self.ln_p2_p(p), kv_src=self.ln_p2_x(x))
+        if self.use_sa_x:
+            x = x + self.sa_x(self.ln_x1(x))
+        if self.use_read1:
+            p = p + self.mha_p1(self.ln_p1_p(p), kv_src=self.ln_p1_x(x))
+        if self.use_read2:
+            p = p + self.mha_p2(self.ln_p2_p(p), kv_src=self.ln_p2_x(x))
 
         # Step 4: both gates read the streams as they were *before* the exchange.
         x_pre, p_pre = x, p
-        if not self.is_last:
+        if self.use_gate_x:
             x = self.ln_x_post(x_pre + self.gate_x(x_pre, p_pre))
-        p = self.ln_p_post(p_pre + self.gate_p(p_pre, x_pre))
+        if self.use_gate_p:
+            p = self.ln_p_post(p_pre + self.gate_p(p_pre, x_pre))
 
-        if not self.is_last:
-            # Steps 5–6: x reads the updated p; the result only enters x's FFN.
-            bypass = self.mha_bypass(self.ln_by_x(x), kv_src=self.ln_by_p(p))
-            x = x + self.ffwd_x(torch.cat([self.ln_x_ffn(x), bypass], dim=-1))
+        if self.use_ffn_x:
+            h = self.ln_x_ffn(x)
+            if self.use_bypass:
+                # Step 5: x reads the updated p; the result only enters x's FFN.
+                bypass = self.mha_bypass(self.ln_by_x(x), kv_src=self.ln_by_p(p))
+                h = torch.cat([h, bypass], dim=-1)
+            x = x + self.ffwd_x(h)
 
-        # Step 7
-        p = p + self.ffwd_p(self.ln_p_ffn(p))
+        if self.use_ffn_p:
+            p = p + self.ffwd_p(self.ln_p_ffn(p))
         return x, p
+
+
+def last_x_read(cfg: ModelConfig) -> int:
+    """Index of the last layer in which p takes information from x."""
+    reads = cfg.layers("p_read1") | cfg.layers("p_read2") | cfg.layers("gate_p")
+    return max(reads)
 
 
 class ThinkPadGPT(_LanguageModel):
@@ -250,7 +273,7 @@ class ThinkPadGPT(_LanguageModel):
         self.token_embedding_table = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.position_embedding_table = nn.Embedding(cfg.block_size, cfg.n_embd)
         self.blocks = nn.ModuleList(
-            [ThinkPadBlock(cfg, is_last=(i == cfg.n_layer - 1)) for i in range(cfg.n_layer)]
+            [ThinkPadBlock(cfg, i, last_x_read(cfg)) for i in range(cfg.n_layer)]
         )
         self.ln_p_f = nn.LayerNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)

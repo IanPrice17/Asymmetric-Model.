@@ -13,6 +13,7 @@ import argparse
 import torch
 
 from .config import ModelConfig
+from .data import load_codec
 from .model import _LanguageModel, build_model, load_state_dict_compat
 
 
@@ -46,17 +47,22 @@ def main(argv=None) -> None:
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--arch", choices=["thinkpad", "baseline"], default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument(
+        "--data_dir",
+        default=None,
+        help="dataset dir (for the tokenizer); default: the one the run trained on",
+    )
     args = ap.parse_args(argv)
 
-    import tiktoken
-
-    enc = tiktoken.get_encoding("gpt2")
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    data_dir = args.data_dir or ckpt.get("train_config", {}).get("data_dir", "data/wikitext103")
+    encode, decode = load_codec(data_dir)
     model = load_model(args.checkpoint, args.arch, args.device)
     torch.manual_seed(args.seed)
-    prompt = torch.tensor([enc.encode_ordinary(args.prompt)], device=args.device)
+    prompt = torch.tensor([encode(args.prompt)], device=args.device)
     for i in range(args.num_samples):
         out = model.generate(prompt, args.max_new_tokens, args.temperature, args.top_k)
-        print(f"--- sample {i + 1} ---\n{enc.decode(out[0].tolist())}\n")
+        print(f"--- sample {i + 1} ---\n{decode(out[0].tolist())}\n")
 
 
 if __name__ == "__main__":

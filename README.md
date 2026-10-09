@@ -102,7 +102,7 @@ python -m thinkpad.sample runs/thinkpad/best_model.pt --prompt "The history of"
 
 The first training run downloads WikiText-103 and tokenizes it into `data/wikitext103/` (about 500 MB to download). Every config field can be overridden from the command line; see `python -m thinkpad.train --help`. Use `--arch thinkpad-tiny` for a quick CPU run.
 
-### On Google Colab (A100)
+### On Google Colab (any GPU)
 
 ```python
 from google.colab import drive
@@ -118,6 +118,41 @@ drive.mount("/content/drive")
 ```
 
 Keeping `--data_dir` and `--out_dir` on Drive means a disconnected session resumes where it stopped: run the same command again. A run directory is tied to one model config; resuming with a different config is refused, so runs can't overwrite each other.
+
+Any GPU works. Precision is chosen automatically: bfloat16 where the GPU supports it (A100, L4, H100, RTX 30-series and newer), float32 elsewhere (T4, V100, CPU). On a free-tier T4, shrink the run so it finishes in a session, for example `--batch_size 32 --max_iters 2500`, or use the ablation runner below.
+
+## Ablations
+
+Every step of the Think-Pad block except x's self-attention can be switched off, per layer, from the command line:
+
+| Flag | Step |
+|---|---|
+| `--p_read1` | 2 · p attends to x |
+| `--p_read2` | 3 · p attends to x again |
+| `--gate_x` | 4 · gate p into x (+ post-LN on x) |
+| `--gate_p` | 4 · gate x into p (+ post-LN on p) |
+| `--bypass` | 5 · x attends to p, result feeds x's FFN |
+| `--ffn_x` | 6 · x FFN |
+| `--ffn_p` | 7 · p FFN |
+
+Each takes a layer spec: `all` (default), `none`, `even`, `odd`, `first:K`, `last:K` (K may be `half`), or indices like `0,3,5`. For example, `--p_read2 none --bypass even` reads x once per layer and keeps the bypass only in even layers. Layers that are switched off aren't built, so parameters and FLOPs drop with them.
+
+`thinkpad/ablate.py` runs a whole sweep at **equal training compute**: every variant gets the full model's FLOPs budget, so a cheaper variant trains for more steps. It answers whether a step is worth its cost, not just whether it helps.
+
+```bash
+# Quick pilot on CPU or any GPU: small character-level models on Tiny Shakespeare (~1 hour on CPU)
+python -m thinkpad.ablate --model thinkpad-char --baseline baseline-char \
+    --dataset shakespeare_char --data_dir data/shakespeare_char \
+    --out_root runs/ablate-char --steps 800 --batch_size 32 --seeds 2 \
+    -- --learning_rate 1e-3 --min_lr 1e-4 --warmup_iters 50 --eval_interval 100 --eval_iters 10
+
+# Full-size models on WikiText-103 (GPU)
+python -m thinkpad.ablate --out_root runs/ablate --steps 2500
+```
+
+**Pilot results** (small character-level models, CPU): [results/pilot-shakespeare-char](results/pilot-shakespeare-char/README.md). The short version: every cut that made the model cheaper helped at equal compute, but a plain GPT of the same small size helped just as much. The full-size WikiText-103 sweep is the real test.
+
+The variants, in order: `full`; `one_read` (no step 3); `one_read_no_bypass` (no steps 3 and 5); then each single step removed (`no_gate_x`, `no_gate_p`, `no_bypass`, `no_ffn_p`); then steps 2–5 in only some layers (`cross_even`, `cross_first_half`, `cross_last_half`); and a plain GPT at the same compute. Choose with `--phases` or `--only`. The sweep writes a ranked table to `summary.md`, the numbers to `summary.json`, and every validation curve to `val_loss_vs_flops.png`.
 
 ## What a run writes
 
@@ -138,11 +173,12 @@ Validation loss is computed exactly over the whole validation split, in non-over
 thinkpad/
   config.py     model presets and training config
   model.py      ThinkPadGPT and BaselineGPT
-  data.py       WikiText-103 tokenization and batching
+  data.py       WikiText-103 and Tiny Shakespeare preparation, batching
   flops.py      analytic and measured FLOPs
   train.py      training loop and CLI
   sample.py     text generation from a checkpoint
   plot.py       validation loss vs. compute figure
+  ablate.py     equal-compute ablation sweeps
 tests/          pytest suite (runs on CPU in CI)
 ```
 

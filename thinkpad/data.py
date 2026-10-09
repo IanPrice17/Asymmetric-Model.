@@ -76,6 +76,63 @@ def prepare_wikitext103(data_dir: str) -> None:
         print(f"  {split}: {n:,} tokens -> {split_path(data_dir, split)}")
 
 
+SHAKESPEARE_URL = (
+    "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+)
+
+
+def prepare_shakespeare_char(data_dir: str) -> None:
+    """Tiny Shakespeare at the character level (65 symbols), split 90/5/5.
+
+    About 1M characters: small enough for CPU pilots, too small for final results.
+    """
+    if all(os.path.exists(split_path(data_dir, s)) for s in SPLITS):
+        return
+    import json
+    import urllib.request
+
+    os.makedirs(data_dir, exist_ok=True)
+    print(f"Downloading Tiny Shakespeare from {SHAKESPEARE_URL} ...")
+    with urllib.request.urlopen(SHAKESPEARE_URL) as r:
+        text = r.read().decode("utf-8")
+    chars = sorted(set(text))
+    stoi = {c: i for i, c in enumerate(chars)}
+    ids = np.array([stoi[c] for c in text], dtype=np.uint16)
+    a, b = int(0.90 * len(ids)), int(0.95 * len(ids))
+    for split, part in zip(SPLITS, (ids[:a], ids[a:b], ids[b:]), strict=True):
+        part.tofile(split_path(data_dir, split))
+        print(f"  {split}: {len(part):,} characters")
+    with open(os.path.join(data_dir, "meta.json"), "w") as f:
+        json.dump({"vocab": chars}, f)
+
+
+DATASETS = {"wikitext103": prepare_wikitext103, "shakespeare_char": prepare_shakespeare_char}
+
+
+def prepare(dataset: str, data_dir: str) -> None:
+    if dataset not in DATASETS:
+        raise ValueError(f"unknown dataset {dataset!r}; choose from {sorted(DATASETS)}")
+    DATASETS[dataset](data_dir)
+
+
+def load_codec(data_dir: str) -> tuple[Callable[[str], list[int]], Callable[[list[int]], str]]:
+    """(encode, decode) for a prepared dataset: characters if meta.json exists, else GPT-2 BPE."""
+    meta = os.path.join(data_dir, "meta.json")
+    if os.path.exists(meta):
+        import json
+
+        with open(meta) as f:
+            chars = json.load(f)["vocab"]
+        stoi = {c: i for i, c in enumerate(chars)}
+        return (lambda s: [stoi[c] for c in s if c in stoi]), (
+            lambda ids: "".join(chars[i] for i in ids)
+        )
+    import tiktoken
+
+    enc = tiktoken.get_encoding("gpt2")
+    return enc.encode_ordinary, enc.decode
+
+
 class TokenData:
     """A memory-mapped token file that serves (input, target) batches."""
 
