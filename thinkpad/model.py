@@ -1,28 +1,21 @@
-"""Think-Pad: a dual-stream transformer, plus the vanilla GPT baseline it is compared with.
+"""Think-Pad and the GPT baseline.
 
-Think-Pad keeps two residual streams of the same width:
+Two residual streams, same width:
+  x - the backbone, basically a normal GPT stream (gets the token embeddings)
+  p - the "pad", starts at zero, reads from x, and is what we predict from
 
-* ``x``, the backbone, which looks like an ordinary GPT stream;
-* ``p``, the "pad", which starts at zero, reads from ``x`` and is the stream
-  the next-token prediction is made from.
+Block steps (any of 2-7 can be switched off per layer, see config.py):
+  1. x self-attention
+  2. p attends to x
+  3. p attends to x again (separate weights)
+  4. gated exchange between x and p, then LayerNorm on each
+  5. x attends to p, result goes into x's FFN (not the residual)
+  6. x FFN
+  7. p FFN
 
-Each block (see ``ThinkPadBlock.forward``):
-
-1. ``x`` self-attention (pre-norm residual).
-2. ``p`` attends to ``x`` (pre-norm residual).
-3. ``p`` attends to ``x`` again with separate weights.
-4. Gated exchange: each stream mixes in the other through a learned sigmoid
-   gate, followed by a post-LayerNorm on both streams.
-5. ``x`` attends to ``p``; the result is not added to ``x`` but is fed to x's FFN.
-6. ``x`` FFN on ``[LN(x), bypass]`` (residual).
-7. ``p`` FFN (residual).
-
-All attention is causal. Cross-stream attention is causal too, because both
-streams index the same token positions: position ``t`` of one stream only
-reads positions ``<= t`` of the other.
-
-Module and parameter names match the original Colab scripts, so checkpoints
-trained with them load here (see ``load_state_dict_compat``).
+Cross-attention between the streams is still causal since both streams share
+token positions. Param names match my original Colab notebooks so old
+checkpoints still load.
 """
 
 from __future__ import annotations
@@ -35,16 +28,10 @@ from torch.nn import functional as F
 
 from .config import STEP_FIELDS, ModelConfig
 
-# ── Shared layers ─────────────────────────────────────────────────────────
-
 
 class MultiHeadAttention(nn.Module):
-    """Causal multi-head attention with optional cross-stream keys and values.
-
-    Queries come from ``x``; keys and values come from ``kv_src`` (``x`` itself
-    when omitted). Separate Q/K/V projections keep cross-attention simple.
-    """
-
+    # q comes from x, k/v from kv_src (or x if not given). separate projections
+    # so the same module works for self- and cross-attention
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.n_head = cfg.n_head
@@ -56,7 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.proj.RESIDUAL_PROJ = True
         self.dropout = cfg.dropout
 
-    def forward(self, x: torch.Tensor, kv_src: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x, kv_src=None):
         B, T, C = x.shape
         if kv_src is None:
             kv_src = x
@@ -70,8 +57,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class FusedSelfAttention(nn.Module):
-    """Causal self-attention with a fused QKV projection (used by the baseline)."""
-
+    # standard GPT attention w/ one qkv matrix, only used by the baseline
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.n_head = cfg.n_head
@@ -82,7 +68,7 @@ class FusedSelfAttention(nn.Module):
         self.proj.RESIDUAL_PROJ = True
         self.dropout = cfg.dropout
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, T, C = x.shape
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
@@ -95,7 +81,7 @@ class FusedSelfAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, cfg: ModelConfig, input_dim: int | None = None):
+    def __init__(self, cfg: ModelConfig, input_dim=None):
         super().__init__()
         n = cfg.n_embd
         self.net = nn.Sequential(
@@ -106,47 +92,44 @@ class FeedForward(nn.Module):
         )
         self.net[2].RESIDUAL_PROJ = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.net(x)
 
 
 class GatedCrossConnect(nn.Module):
-    """``g * src + (1 - g) * tgt`` with ``g = sigmoid(W [tgt; src])``, per channel."""
-
+    # g = sigmoid(W [tgt; src]) per channel, returns g*src + (1-g)*tgt
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.gate_proj = nn.Linear(2 * cfg.n_embd, cfg.n_embd, bias=False)
 
-    def forward(self, tgt: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    def forward(self, tgt, src):
         gate = torch.sigmoid(self.gate_proj(torch.cat([tgt, src], dim=-1)))
         return gate * src + (1 - gate) * tgt
 
 
-# ── Base class: embeddings, init, loss, generation ──────────────────────────
-
-
 class _LanguageModel(nn.Module):
+    # shared bits: init, embeddings, loss, sampling
     cfg: ModelConfig
 
-    def _init_weights(self, module: nn.Module) -> None:
+    def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
             if getattr(module, "RESIDUAL_PROJ", False):
-                std = 0.02 / math.sqrt(2 * self.cfg.n_layer)
+                std = 0.02 / math.sqrt(2 * self.cfg.n_layer)  # GPT-2 style scaled init
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def _embed(self, idx: torch.Tensor) -> torch.Tensor:
+    def _embed(self, idx):
         T = idx.shape[1]
         if self.cfg.block_size < T:
             raise ValueError(f"sequence length {T} exceeds block_size {self.cfg.block_size}")
         pos = torch.arange(T, device=idx.device)
         return self.token_embedding_table(idx) + self.position_embedding_table(pos)
 
-    def _logits_and_loss(self, h: torch.Tensor, targets: torch.Tensor | None):
+    def _logits_and_loss(self, h, targets):
         logits = self.lm_head(h)
         if targets is None:
             return logits, None
@@ -154,13 +137,7 @@ class _LanguageModel(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(
-        self,
-        idx: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: int | None = None,
-    ) -> torch.Tensor:
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         was_training = self.training
         self.eval()
         for _ in range(max_new_tokens):
@@ -175,25 +152,17 @@ class _LanguageModel(nn.Module):
         return idx
 
 
-# ── Think-Pad ──────────────────────────────────────────────────────────────
-
-
 class ThinkPadBlock(nn.Module):
-    """One dual-stream block.
-
-    Which steps run is set per layer by the config's step switches (all on by
-    default). Parts of the ``x`` stream that can no longer reach ``p`` are not
-    built: the loss is computed from ``p`` only, so after the last point where
-    ``p`` reads ``x`` (``last_x_read``), further ``x`` updates would never get a
-    gradient. With the default config this removes steps 4-6 for ``x`` in the
-    final block, which does not change the function the model computes.
-    """
+    # Only builds the steps that are switched on for this layer. Since the loss
+    # only uses p, any x work after the last layer where p reads x can never get
+    # a gradient, so it's skipped too (by default that's steps 4-6 for x in the
+    # last block - same function, fewer dead params).
 
     def __init__(self, cfg: ModelConfig, layer: int, last_x_read: int):
         super().__init__()
         n = cfg.n_embd
         on = {step: layer in cfg.layers(step) for step in STEP_FIELDS}
-        x_live = layer < last_x_read  # does x after this layer's reads still matter?
+        x_live = layer < last_x_read  # does x still matter after this layer?
 
         self.use_sa_x = layer <= last_x_read
         self.use_read1 = on["p_read1"]
@@ -205,49 +174,48 @@ class ThinkPadBlock(nn.Module):
         self.use_ffn_x = on["ffn_x"] and x_live
         self.use_bypass = on["bypass"] and self.use_ffn_x  # bypass only feeds x's FFN
 
-        if self.use_sa_x:  # Step 1: x self-attention
+        if self.use_sa_x:  # 1
             self.sa_x = MultiHeadAttention(cfg)
             self.ln_x1 = nn.LayerNorm(n)
-        if self.use_read1:  # Step 2: p reads x
+        if self.use_read1:  # 2
             self.mha_p1 = MultiHeadAttention(cfg)
             self.ln_p1_p = nn.LayerNorm(n)
             self.ln_p1_x = nn.LayerNorm(n)
-        if self.use_read2:  # Step 3: p reads x again (separate weights)
+        if self.use_read2:  # 3
             self.mha_p2 = MultiHeadAttention(cfg)
             self.ln_p2_p = nn.LayerNorm(n)
             self.ln_p2_x = nn.LayerNorm(n)
-        if self.use_sa_p:  # Optional: p self-attention, after p's reads, before the gates
+        if self.use_sa_p:  # optional p self-attention (not in the original design)
             self.sa_p = MultiHeadAttention(cfg)
             self.ln_p_sa = nn.LayerNorm(n)
-        if self.use_gate_x:  # Step 4, x side: gate p into x, then post-LN
+        if self.use_gate_x:  # 4, p -> x
             self.gate_x = GatedCrossConnect(cfg)
             self.ln_x_post = nn.LayerNorm(n)
-        if self.use_gate_p:  # Step 4, p side: gate x into p, then post-LN
+        if self.use_gate_p:  # 4, x -> p
             self.gate_p = GatedCrossConnect(cfg)
             self.ln_p_post = nn.LayerNorm(n)
-        if self.use_bypass:  # Step 5: x reads p; result feeds x's FFN only
+        if self.use_bypass:  # 5
             self.mha_bypass = MultiHeadAttention(cfg)
             self.ln_by_x = nn.LayerNorm(n)
             self.ln_by_p = nn.LayerNorm(n)
-        if self.use_ffn_x:  # Step 6: x FFN on [LN(x), bypass] (or LN(x) without bypass)
+        if self.use_ffn_x:  # 6, input is [LN(x), bypass] when the bypass is on
             self.ffwd_x = FeedForward(cfg, input_dim=2 * n if self.use_bypass else n)
             self.ln_x_ffn = nn.LayerNorm(n)
-        if self.use_ffn_p:  # Step 7: p FFN
+        if self.use_ffn_p:  # 7
             self.ffwd_p = FeedForward(cfg)
             self.ln_p_ffn = nn.LayerNorm(n)
 
-    def forward(self, x: torch.Tensor, p: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x, p):
         if self.use_sa_x:
             x = x + self.sa_x(self.ln_x1(x))
         if self.use_read1:
             p = p + self.mha_p1(self.ln_p1_p(p), kv_src=self.ln_p1_x(x))
         if self.use_read2:
             p = p + self.mha_p2(self.ln_p2_p(p), kv_src=self.ln_p2_x(x))
-
-        if self.use_sa_p:  # p attends to its own earlier positions before the exchange
+        if self.use_sa_p:
             p = p + self.sa_p(self.ln_p_sa(p))
 
-        # Step 4: both gates read the streams as they were *before* the exchange.
+        # both gates use the streams from before the swap
         x_pre, p_pre = x, p
         if self.use_gate_x:
             x = self.ln_x_post(x_pre + self.gate_x(x_pre, p_pre))
@@ -257,7 +225,6 @@ class ThinkPadBlock(nn.Module):
         if self.use_ffn_x:
             h = self.ln_x_ffn(x)
             if self.use_bypass:
-                # Step 5: x reads the updated p; the result only enters x's FFN.
                 bypass = self.mha_bypass(self.ln_by_x(x), kv_src=self.ln_by_p(p))
                 h = torch.cat([h, bypass], dim=-1)
             x = x + self.ffwd_x(h)
@@ -268,9 +235,8 @@ class ThinkPadBlock(nn.Module):
 
 
 def last_x_read(cfg: ModelConfig) -> int:
-    """Index of the last layer in which p takes information from x."""
-    reads = cfg.layers("p_read1") | cfg.layers("p_read2") | cfg.layers("gate_p")
-    return max(reads)
+    # last layer where p still pulls anything out of x
+    return max(cfg.layers("p_read1") | cfg.layers("p_read2") | cfg.layers("gate_p"))
 
 
 class ThinkPadGPT(_LanguageModel):
@@ -284,18 +250,15 @@ class ThinkPadGPT(_LanguageModel):
         )
         self.ln_p_f = nn.LayerNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
-        self.lm_head.weight = self.token_embedding_table.weight  # weight tying
+        self.lm_head.weight = self.token_embedding_table.weight  # tied
         self.apply(self._init_weights)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(self, idx, targets=None):
         x = self._embed(idx)
         p = torch.zeros_like(x)
         for block in self.blocks:
             x, p = block(x, p)
-        return self._logits_and_loss(self.ln_p_f(p), targets)
-
-
-# ── Baseline GPT ───────────────────────────────────────────────────────────
+        return self._logits_and_loss(self.ln_p_f(p), targets)  # predict from p
 
 
 class Block(nn.Module):
@@ -306,7 +269,7 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(cfg.n_embd)
         self.ln2 = nn.LayerNorm(cfg.n_embd)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x = x + self.sa(self.ln1(x))
         return x + self.ffwd(self.ln2(x))
 
@@ -320,29 +283,23 @@ class BaselineGPT(_LanguageModel):
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
-        self.lm_head.weight = self.token_embedding_table.weight  # weight tying
+        self.lm_head.weight = self.token_embedding_table.weight  # tied
         self.apply(self._init_weights)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(self, idx, targets=None):
         x = self._embed(idx)
         for block in self.blocks:
             x = block(x)
         return self._logits_and_loss(self.ln_f(x), targets)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
-
-
-def build_model(cfg: ModelConfig) -> _LanguageModel:
+def build_model(cfg: ModelConfig):
     return ThinkPadGPT(cfg) if cfg.arch == "thinkpad" else BaselineGPT(cfg)
 
 
-def count_params(model: nn.Module, non_embedding: bool = False) -> int:
-    """Unique parameters (tied weights counted once).
-
-    With ``non_embedding=True``, token and position embeddings are excluded,
-    the convention used in scaling-law papers.
-    """
+def count_params(model, non_embedding=False):
+    # tied weights only count once. non_embedding drops token + position
+    # embeddings (what scaling-law papers usually report)
     n = sum(p.numel() for p in model.parameters())
     if non_embedding:
         n -= model.token_embedding_table.weight.numel()
@@ -350,13 +307,10 @@ def count_params(model: nn.Module, non_embedding: bool = False) -> int:
     return n
 
 
-def load_state_dict_compat(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> list[str]:
-    """Load a checkpoint, including ones saved by the original Colab scripts.
-
-    Old Think-Pad checkpoints contain the never-trained final-block ``x`` layers
-    and an unused ``ln_f``; those keys are dropped. Any *missing* key is still an
-    error. Returns the list of dropped keys.
-    """
+def load_state_dict_compat(model, state_dict):
+    # Loads new checkpoints and the old Colab ones. Old Think-Pad checkpoints have
+    # the dead last-block x layers + an unused ln_f, so extra keys get dropped.
+    # Missing keys still raise. Returns the dropped keys.
     state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
     expected = model.state_dict().keys()
     dropped = sorted(k for k in state_dict if k not in expected)

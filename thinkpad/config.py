@@ -123,7 +123,7 @@ MODEL_PRESETS: dict[str, ModelConfig] = {
 @dataclass(frozen=True)
 class TrainConfig:
     out_dir: str = "runs/thinkpad"
-    dataset: str = "wikitext103"  # "wikitext103" or "shakespeare_char"
+    dataset: str = "wikitext103"  # "wikitext103", "wikitext2_char" or "shakespeare_char"
     data_dir: str = "data/wikitext103"
     batch_size: int = 64
     max_iters: int = 10_000

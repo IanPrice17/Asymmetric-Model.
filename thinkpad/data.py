@@ -106,7 +106,44 @@ def prepare_shakespeare_char(data_dir: str) -> None:
         json.dump({"vocab": chars}, f)
 
 
-DATASETS = {"wikitext103": prepare_wikitext103, "shakespeare_char": prepare_shakespeare_char}
+WIKITEXT2_URL = (
+    "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/"
+)
+
+
+def prepare_wikitext2_char(data_dir: str) -> None:
+    """WikiText-2 at the character level (~11M training characters, ~10x Tiny Shakespeare).
+
+    Uses the copy in the PyTorch examples repo (already word-tokenized, rare words as
+    <unk>), so it downloads from GitHub. Characters seen only outside the training
+    split are dropped.
+    """
+    if all(os.path.exists(split_path(data_dir, s)) for s in SPLITS):
+        return
+    import json
+    import urllib.request
+
+    os.makedirs(data_dir, exist_ok=True)
+    texts = {}
+    for split, name in zip(SPLITS, ("train", "valid", "test"), strict=True):
+        print(f"Downloading WikiText-2 {name} ...")
+        with urllib.request.urlopen(WIKITEXT2_URL + f"{name}.txt") as r:
+            texts[split] = r.read().decode("utf-8")
+    chars = sorted(set(texts["train"]))
+    stoi = {c: i for i, c in enumerate(chars)}
+    for split, text in texts.items():
+        ids = np.array([stoi[c] for c in text if c in stoi], dtype=np.uint16)
+        ids.tofile(split_path(data_dir, split))
+        print(f"  {split}: {len(ids):,} characters")
+    with open(os.path.join(data_dir, "meta.json"), "w") as f:
+        json.dump({"vocab": chars}, f)
+
+
+DATASETS = {
+    "wikitext103": prepare_wikitext103,
+    "shakespeare_char": prepare_shakespeare_char,
+    "wikitext2_char": prepare_wikitext2_char,
+}
 
 
 def prepare(dataset: str, data_dir: str) -> None:
